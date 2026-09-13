@@ -82,6 +82,23 @@ fn gcs_notification(object: &str, event_type: &str) -> serde_json::Value {
     })
 }
 
+fn azure_notification(object: &str, kind: &str, cloud_events: bool) -> serde_json::Value {
+    let mut event = serde_json::json!({
+        "id": "test-event",
+        "subject": format!("/blobServices/default/containers/walgit/blobs/{object}"),
+        "data": {}
+    });
+    if cloud_events {
+        event["specversion"] = "1.0".into();
+        event["source"] = "/test-source".into();
+        event["type"] = kind.into();
+        event
+    } else {
+        event["eventType"] = kind.into();
+        serde_json::json!([event])
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
     let (url, captured) = webhook().await;
@@ -161,6 +178,9 @@ async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
         serde_json::json!({"Records": [{"eventName": "ObjectCreated:Put", "s3": {"object": {"key": "repos/t/r/manifest.pb"}}}]}),
         serde_json::json!({"repo": "t/r"}),
         serde_json::json!({"key": "repos/t/r/manifest.pb"}),
+        // Azure Event Grid, in both of its schemas.
+        azure_notification("repos/t/r/manifest.pb", "Microsoft.Storage.BlobCreated", false),
+        azure_notification("repos/t/r/manifest.pb", "Microsoft.Storage.BlobCreated", true),
     ] {
         let resp = client
             .post(format!("{}/_events/notify", server.base_url))
@@ -259,5 +279,216 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
         .send()
         .await?;
     assert_eq!(resp.status(), 503, "non-2xx so Pub/Sub redelivers");
+    for cloud_events in [false, true] {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/_events/notify", server.base_url))
+            .json(&azure_notification(
+                "repos/t/r/manifest.pb",
+                "Microsoft.Storage.BlobCreated",
+                cloud_events,
+            ))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 503, "Event Grid must retry sink failures");
+        assert_eq!(cursor_seq(&server, "t", "r").await, None);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn azure_events_and_batches_wake_pending_wal_without_the_sweep() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    server.put_repo("t", "r").await?;
+    let source = TestRepo::synthetic(1, 1)?;
+    let client = reqwest::Client::new();
+    let notify = format!("{}/_events/notify", server.base_url);
+    for (index, (cloud_events, batch)) in
+        [(false, false), (true, false), (false, true), (true, true)]
+            .into_iter()
+            .enumerate()
+    {
+        git_in(&source, &["commit", "--allow-empty", "-m", "Azure notification"])?;
+        git_in(
+            &source,
+            &["push", &server.repo_url("t", "r"), "HEAD:refs/heads/main"],
+        )?;
+        let oid = git_in(&source, &["rev-parse", "HEAD"])?;
+        assert_eq!(captured.lock().unwrap().len(), index);
+        for (key, kind) in [
+            ("repos/t/r/wal/abc.pack", "Microsoft.Storage.BlobCreated"),
+            ("repos/t/r/events/cursor.json", "Microsoft.Storage.BlobCreated"),
+            ("repos/t/r/manifest.pb", "Microsoft.Storage.BlobDeleted"),
+        ] {
+            let resp = client
+                .post(&notify)
+                .json(&azure_notification(key, kind, cloud_events))
+                .send()
+                .await?;
+            assert_eq!(resp.status(), 200);
+            assert_eq!(resp.json::<serde_json::Value>().await?, serde_json::json!([]));
+        }
+        assert_eq!(captured.lock().unwrap().len(), index);
+        let mut body = azure_notification(
+            "repos/t/r/manifest.pb",
+            "Microsoft.Storage.BlobCreated",
+            cloud_events,
+        );
+        if batch {
+            let event = if cloud_events { body } else { body[0].clone() };
+            body = serde_json::json!([event.clone(), event]);
+        }
+        let resp = client.post(&notify).json(&body).send().await?;
+        assert_eq!(resp.status(), 200);
+        let report: serde_json::Value = resp.json().await?;
+        assert_eq!(report[0]["emitted"], 1);
+        if batch {
+            assert_eq!(report[1]["emitted"], 0);
+        }
+        let got = wait_for(&captured, index + 1).await;
+        assert_eq!(got.len(), index + 1);
+        assert_eq!(got[index]["new"], oid.trim());
+        assert_eq!(cursor_seq(&server, "t", "r").await, Some((index + 1) as u64));
+
+        let resp = client.post(&notify).json(&body).send().await?;
+        assert_eq!(resp.status(), 200);
+        let report: Vec<serde_json::Value> = resp.json().await?;
+        assert!(report.iter().all(|entry| entry["emitted"] == 0));
+        assert_eq!(captured.lock().unwrap().len(), index + 1);
+    }
+    Ok(())
+}
+
+/// Event Grid will not create a subscription until its validation code comes
+/// back, and the handshake must not be mistaken for a commit point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_event_grid_handshake_is_answered_without_a_bridge_wake() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/_events/notify", server.base_url))
+        .json(&serde_json::json!([{
+            "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+            "data": {"validationCode": "512d38b6-c7b8"}
+        }]))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["validationResponse"], "512d38b6-c7b8");
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "a handshake is not a commit point"
+    );
+    let endpoint = format!("{}/_events/notify", server.base_url);
+    let client = reqwest::Client::new();
+    for body in [
+        serde_json::json!([{
+            "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+            "data": {"validationCode": ""}
+        }]),
+        serde_json::json!([{
+            "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+            "data": {}
+        }]),
+        serde_json::json!([
+            {"eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+             "data": {"validationCode": "code"}},
+            {"eventType": "Microsoft.Storage.BlobCreated",
+             "subject": "/blobServices/default/containers/walgit/blobs/repos/t/r/manifest.pb"}
+        ]),
+    ] {
+        assert_eq!(
+            client.post(&endpoint).json(&body).send().await?.status(),
+            400
+        );
+    }
+    for origin in [None, Some("")] {
+        let mut request = client.request(reqwest::Method::OPTIONS, &endpoint);
+        if let Some(origin) = origin {
+            request = request.header("webhook-request-origin", origin);
+        }
+        let resp = request.send().await?;
+        assert_eq!(resp.status(), 400);
+        assert!(!resp.headers().contains_key("webhook-allowed-origin"));
+    }
+    let resp = client
+        .request(reqwest::Method::OPTIONS, &endpoint)
+        .header("webhook-request-origin", "eventgrid.azure.net")
+        .header("webhook-request-rate", "120")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["webhook-allowed-origin"], "eventgrid.azure.net");
+    assert_eq!(resp.headers()["webhook-allowed-rate"], "*");
+    assert_eq!(resp.headers()["allow"], "POST, OPTIONS");
+    assert!(captured.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notify_validation_and_delivery_keep_read_auth_and_the_bridge_gate() -> TestResult {
+    let (sink, captured) = webhook().await;
+    let client = reqwest::Client::new();
+    for enabled in [false, true] {
+        let server = Server::start_with_tweak(|cfg| {
+            if enabled {
+                cfg.events.webhook_url = Some(sink.clone());
+            }
+            cfg.events.sweep_interval = Duration::ZERO;
+            cfg.server.auth.mode = walgit_config::AuthMode::Token;
+            cfg.server.auth.anonymous_read = false;
+            cfg.server.auth.tokens = vec![walgit_config::StaticToken {
+                principal: "event-reader".into(),
+                token: "test-notify-reader".into(),
+                token_env: None,
+                write: false,
+                admin: false,
+            }];
+        })
+        .await?;
+        let endpoint = format!("{}/_events/notify", server.base_url);
+        for (method, body) in [
+            (reqwest::Method::OPTIONS, serde_json::Value::Null),
+            (
+                reqwest::Method::POST,
+                serde_json::json!([{
+                    "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+                    "data": {"validationCode": "code"}
+                }]),
+            ),
+            (
+                reqwest::Method::POST,
+                azure_notification(
+                    "repos/t/r/wal/abc.pack",
+                    "Microsoft.Storage.BlobCreated",
+                    true,
+                ),
+            ),
+        ] {
+            for token in [None, Some("invalid"), Some("test-notify-reader")] {
+                let mut request = client
+                    .request(method.clone(), &endpoint)
+                    .header("webhook-request-origin", "eventgrid.azure.net")
+                    .json(&body);
+                if let Some(token) = token {
+                    request = request.bearer_auth(token);
+                }
+                let resp = request.send().await?;
+                let expected = if token != Some("test-notify-reader") {
+                    401
+                } else if enabled {
+                    200
+                } else {
+                    404
+                };
+                assert_eq!(resp.status(), expected);
+                if expected != 200 {
+                    assert!(!resp.headers().contains_key("webhook-allowed-origin"));
+                }
+            }
+        }
+    }
+    assert!(captured.lock().unwrap().is_empty());
     Ok(())
 }

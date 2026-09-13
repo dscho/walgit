@@ -13,7 +13,8 @@
 //! * `POST /_events/notify` with a bucket notification that names a finalized
 //!   `…/manifest.pb` — the commit point itself as a notification. Accepted
 //!   shapes: a GCS Pub/Sub push envelope (`message.attributes.objectId`), an S3
-//!   event notification (`Records[].s3.object.key`), or a plain `{"key": "…"}`
+//!   event notification (`Records[].s3.object.key`), an Azure Event Grid
+//!   `BlobCreated` event in either schema, or a plain `{"key": "…"}`
 //!   / `{"repo": "owner/name"}`. A non-2xx here is meant to be redelivered;
 //! * the sweep (`events.sweep_interval`): every repo — the backstop. A sweep
 //!   that finds unpublished entries means the notifications are not flowing
@@ -258,6 +259,39 @@ impl Bridge {
     }
 }
 
+/// Event Grid names it `eventType` in its own schema and `type` in `CloudEvents`.
+fn event_type(event: &serde_json::Value) -> &serde_json::Value {
+    if event["eventType"].is_string() {
+        &event["eventType"]
+    } else {
+        &event["type"]
+    }
+}
+
+/// Native Event Grid validates by POST; `CloudEvents` validates by OPTIONS.
+fn validation_code(
+    v: &serde_json::Value,
+) -> Result<Option<&str>, crate::error::ApiError> {
+    use crate::error::ApiError;
+    let events = v.as_array().map_or(std::slice::from_ref(v), Vec::as_slice);
+    let Some(event) = events
+        .iter()
+        .find(|event| event["eventType"] == "Microsoft.EventGrid.SubscriptionValidationEvent")
+    else {
+        return Ok(None);
+    };
+    if !v.is_array() || events.len() != 1 {
+        return Err(ApiError::BadRequest(
+            "subscription validation must be a single-event array".into(),
+        ));
+    }
+    event["data"]["validationCode"]
+        .as_str()
+        .filter(|code| !code.is_empty())
+        .map(Some)
+        .ok_or_else(|| ApiError::BadRequest("subscription validation needs a nonempty code".into()))
+}
+
 /// The object keys (or repository ids) a notification body names. Store-agnostic.
 fn notified_keys(v: &serde_json::Value) -> Vec<String> {
     let mut keys = Vec::new();
@@ -295,6 +329,17 @@ fn notified_keys(v: &serde_json::Value) -> Vec<String> {
             }
         }
     }
+    // Azure Event Grid, in either schema: an array or one CloudEvent.
+    // `subject` is the documented blob locator; `data.url` is an
+    // absolute URL whose container segment we would have to strip anyway.
+    for event in v.as_array().map_or(std::slice::from_ref(v), Vec::as_slice) {
+        if event_type(event) == "Microsoft.Storage.BlobCreated"
+            && let Some(subject) = event["subject"].as_str()
+            && let Some((_, key)) = subject.split_once("/blobs/")
+        {
+            keys.push(key.to_string());
+        }
+    }
     // Plain shapes for your own glue.
     if let Some(k) = v["key"].as_str() {
         keys.push(k.to_string());
@@ -323,6 +368,10 @@ pub async fn http_notify(
     let bytes = crate::collect_body(body).await?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| ApiError::BadRequest(format!("notify body: {e}")))?;
+    // Event Grid will not create a subscription until this is echoed back.
+    if let Some(code) = validation_code(&v)? {
+        return Ok(axum::Json(serde_json::json!({ "validationResponse": code })).into_response());
+    }
     let mut reports = Vec::new();
     for key in notified_keys(&v) {
         match bridge.object_finalized(&key).await {
@@ -339,6 +388,32 @@ pub async fn http_notify(
         }
     }
     Ok(axum::Json(reports).into_response())
+}
+
+/// `CloudEvents` delivery consent uses the same auth and bridge gate as POST.
+pub async fn http_notify_options(
+    st: &crate::AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<axum::response::Response, crate::error::ApiError> {
+    use crate::error::ApiError;
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::IntoResponse;
+    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    if st.bridge.is_none() {
+        return Err(ApiError::NotFound(
+            "events bridge is not enabled here".into(),
+        ));
+    }
+    let origin = headers
+        .get("webhook-request-origin")
+        .filter(|origin| !origin.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("WebHook-Request-Origin is required".into()))?;
+    let mut response = StatusCode::OK.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::ALLOW, HeaderValue::from_static("POST, OPTIONS"));
+    headers.insert("webhook-allowed-origin", origin.clone());
+    headers.insert("webhook-allowed-rate", HeaderValue::from_static("*"));
+    Ok(response)
 }
 
 fn auth_err(e: crate::auth::AuthError) -> crate::error::ApiError {

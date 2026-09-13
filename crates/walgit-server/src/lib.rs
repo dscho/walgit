@@ -190,9 +190,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // bearer, never repo data — today exactly the installer, everything else 404.
         .merge(web::ui::public_router(state.clone()).with_state(()))
         .merge(web::login::router(state.clone()).with_state(()))
-        // Events bridge wake-up (docs/EVENTS.md): the Pub/Sub push envelope of
-        // a GCS notification. Authenticated (the push SA's ID token); 404 when
-        // this instance is not a bridge.
+        // Authenticated bucket notifications and CloudEvents validation;
+        // 404 when this instance is not an events bridge (docs/EVENTS.md).
         .route(
             "/_events/notify",
             axum::routing::post(
@@ -200,6 +199,14 @@ pub fn router(state: Arc<AppState>) -> Router {
                  headers: axum::http::HeaderMap,
                  body: Body| async move {
                     bridge::http_notify(&st, &headers, body)
+                        .await
+                        .unwrap_or_else(axum::response::IntoResponse::into_response)
+                },
+            )
+            .options(
+                |axum::extract::State(st): axum::extract::State<Arc<AppState>>,
+                 headers: axum::http::HeaderMap| async move {
+                    bridge::http_notify_options(&st, &headers)
                         .await
                         .unwrap_or_else(axum::response::IntoResponse::into_response)
                 },

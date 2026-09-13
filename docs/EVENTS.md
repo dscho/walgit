@@ -96,8 +96,9 @@ Wake-ups (both idempotent; they only ever call `catch_up`):
 - `POST /_events/notify` with a **bucket notification** naming a finalized `…/manifest.pb` — the commit point
   itself as the notification. Accepted bodies: a GCS Pub/Sub push envelope (`message.attributes.eventType =
   OBJECT_FINALIZE`, `objectId`), an S3 event notification (`Records[].eventName = ObjectCreated:*`,
-  `s3.object.key`; MinIO, rustfs and Ceph emit the same shape), or your own glue's `{"key": "repos/o/r/manifest.pb"}`
-  / `{"repo": "o/r"}`. Everything else is acked and ignored; a webhook failure answers 503 so the notifier
+  `s3.object.key`; MinIO, rustfs and Ceph emit the same shape), an Azure Event Grid
+  `Microsoft.Storage.BlobCreated` event in the EventGrid or CloudEvents schema, or your own glue's
+  `{"key": "repos/o/r/manifest.pb"}` / `{"repo": "o/r"}`. Everything else is acked and ignored; a webhook failure answers 503 so the notifier
   redelivers. Authenticated like every route (`require_read`): give the notifier a token.
 - The sweep (`events.sweep_interval`, default 5 min): `list` + one conditional manifest GET per repo. Not needed
   for correctness; it is the backstop *and the health check* — a sweep that publishes anything means
@@ -112,6 +113,20 @@ webhook_url = "https://hooks.example.com/walgit"
 webhook_secret = "…"          # env: WALGIT__EVENTS__WEBHOOK_SECRET
 sweep_interval = "5m"
 ```
+
+For Azure Event Grid, create the subscription on the storage account, filtering by subject prefix
+`/blobServices/default/containers/<container>/blobs/<store-prefix>repos/` and suffix `/manifest.pb`.
+Direct webhook delivery to `/_events/notify` requires publicly reachable HTTPS.
+[Native-schema validation](https://learn.microsoft.com/en-us/azure/event-grid/end-point-validation-event-grid-events-schema)
+uses a standalone `SubscriptionValidationEvent` POST whose code is echoed as `validationResponse`;
+invalid payloads or mixed validation batches return 400.
+[CloudEvents validation](https://learn.microsoft.com/en-us/azure/event-grid/end-point-validation-cloud-events-schema)
+uses OPTIONS: `WebHook-Request-Origin` is echoed as `WebHook-Allowed-Origin`, with
+`WebHook-Allowed-Rate: *` and `Allow: POST, OPTIONS`. Both handshakes use the same `require_read`
+authentication as notifications and return 404 when the events bridge is disabled.
+Authentication can use a
+[static secret `Authorization` delivery header](https://learn.microsoft.com/en-us/azure/event-grid/delivery-properties)
+or a compatible existing OIDC setup; Entra ID is not required. Query-string credentials are not accepted.
 
 ## Consumer checklist
 
