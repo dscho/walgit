@@ -3,6 +3,24 @@ use futures::StreamExt;
 
 use crate::{ByteStream, Result, StoreError};
 
+#[cfg(any(feature = "gcs", feature = "azure"))]
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "Object store control keys use exact case-sensitive suffixes"
+)]
+pub(crate) fn is_bulk_key(key: &str) -> bool {
+    // Packs and LFS are bulk; manifests, logs, checkpoints, leases and policy
+    // stay on the control transport even during a large transfer.
+    let name = key.rsplit('/').next().unwrap_or(key);
+    if name.ends_with(".pb") || name.ends_with(".json") {
+        return false;
+    }
+    key.contains("/wal/")
+        || key.starts_with("wal/")
+        || key.contains("/lfs/")
+        || key.starts_with("lfs/")
+}
+
 /// Collect a byte stream. `size_hint` pre-allocates.
 pub async fn collect(mut body: ByteStream, size_hint: usize) -> Result<Bytes> {
     let mut first: Option<Bytes> = None;
@@ -279,4 +297,38 @@ pub fn encode_path(key: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(all(test, any(feature = "gcs", feature = "azure")))]
+mod bulk_key_tests {
+    use super::is_bulk_key;
+
+    #[test]
+    fn control_plane_keys_are_never_bulk() {
+        for k in [
+            "prefix/repos/o/r/manifest.pb",
+            "prefix/repos/o/r/log/0000000000000001.pb",
+            "prefix/repos/o/r/checkpoints/0000000000000001/refs.pb",
+            "prefix/repos/o/r/leases/compact.pb",
+            "prefix/repos/o/r/policy.json",
+            "prefix/repos/o/r/cache/api/v1/abc.json",
+            "wal/descriptor.pb",
+            "lfs/metadata.json",
+            "arbitrary.idx",
+        ] {
+            assert!(!is_bulk_key(k), "{k} must be control plane");
+        }
+        for k in [
+            "prefix/repos/o/r/wal/abc.pack",
+            "prefix/repos/o/r/wal/abc.idx",
+            "prefix/repos/o/r/wal/abc.rev",
+            "prefix/repos/o/r/wal/abc.bitmap",
+            "prefix/repos/o/r/wal/abc.commit-graph",
+            "prefix/repos/o/r/lfs/objects/ab/cd/abcd",
+            "wal/abc.pack",
+            "lfs/objects/ab/cd/abcd",
+        ] {
+            assert!(is_bulk_key(k), "{k} must be bulk");
+        }
+    }
 }

@@ -1,9 +1,10 @@
 //! Azure Blob Storage with conditional publication and bounded streaming.
 //!
 //! The generated SDK lacks delimiter/BlobPrefix support, and its managed GET
-//! partitions even a single requested range. Those two operations use the same
-//! SDK HTTP pipeline directly; all authentication, retry and transport remain
-//! SDK-owned. PUTs publish once, after uniquely named blocks have been staged.
+//! partitions even a single requested range. Those two operations use the
+//! SDK HTTP pipeline directly. Control and bulk traffic use independent HTTP
+//! clients with a shared authorization cache; authentication, retry and transport
+//! remain SDK-owned. PUTs publish once, after uniquely named blocks have been staged.
 //! Signed URLs are user-delegation SAS: HMAC over a cached key the account
 //! issues to this identity, so walgit never holds a shared key.
 
@@ -61,8 +62,8 @@ const DELEGATION_KEY_LIFETIME: Duration = Duration::hours(24);
 const DELEGATION_KEY_MAX_LIFETIME: Duration = Duration::days(7);
 
 pub struct AzureStore {
-    container: Arc<BlobContainerClient>,
-    pipeline: Pipeline,
+    control: AzureClient,
+    bulk: AzureClient,
     /// `None` under SAS authentication (a user delegation key needs an Entra
     /// identity, and the configured SAS may grant more than a read) or when
     /// no account name is known for the canonical resource.
@@ -73,6 +74,11 @@ pub struct AzureStore {
     multipart_threshold: u64,
     multipart_part_size: usize,
     max_concurrent_blocks: usize,
+}
+
+struct AzureClient {
+    container: Arc<BlobContainerClient>,
+    pipeline: Pipeline,
 }
 
 struct Signing {
@@ -124,14 +130,21 @@ impl AzureStore {
         } else {
             Some(credential(cfg.azure.credential)?)
         };
-        Self::with_client_options(cfg, url, credential, ClientOptions::default())
+        Self::with_client_options(
+            cfg,
+            url,
+            credential,
+            ClientOptions::default(),
+            ClientOptions::default(),
+        )
     }
 
     fn with_client_options(
         cfg: &StoreConfig,
         url: Url,
         credential: Option<Arc<dyn TokenCredential>>,
-        mut options: ClientOptions,
+        mut control_options: ClientOptions,
+        mut bulk_options: ClientOptions,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             (1..=MAX_BLOCK_BYTES).contains(&cfg.multipart_part_size.as_u64()),
@@ -149,14 +162,6 @@ impl AzureStore {
             credential.is_none() || url.scheme() == "https",
             "azure: identity authentication requires HTTPS"
         );
-        // Disable transparent decompression: stored bytes and byte ranges are exact.
-        if options.transport.is_none() {
-            options.transport = Some(azure_core::http::Transport::new(
-                azure_core::http::new_http_client(Some(azure_core::http::HttpClientOptions {
-                    automatic_decompression: false,
-                })),
-            ));
-        }
         let sas_auth = credential.is_none();
         let signing = if sas_auth {
             None
@@ -166,9 +171,43 @@ impl AzureStore {
         if let Some(credential) = credential {
             // One authorizer/cache supplies both headers on each retry of a
             // server-side copy. A private source does not inherit destination auth.
-            options.per_try_policies.push(Arc::new(
+            let authorization = Arc::new(
                 BearerTokenAuthorizationPolicy::new(credential, [STORAGE_SCOPE])
                     .with_on_request(Arc::new(BlobAuthorization)),
+            );
+            control_options.per_try_policies.push(authorization.clone());
+            bulk_options.per_try_policies.push(authorization);
+        }
+        Ok(Self {
+            control: AzureClient::new(url.clone(), control_options)?,
+            bulk: AzureClient::new(url, bulk_options)?,
+            signing,
+            delegation_key: parking_lot::Mutex::new(None),
+            sas_auth,
+            multipart_threshold: cfg.multipart_threshold.as_u64(),
+            multipart_part_size: usize::try_from(cfg.multipart_part_size.as_u64())?,
+            max_concurrent_blocks: cfg.azure.max_concurrent_blocks,
+        })
+    }
+
+    fn data_client(&self, key: &str, ranged: bool) -> &AzureClient {
+        if ranged || util::is_bulk_key(key) {
+            &self.bulk
+        } else {
+            &self.control
+        }
+    }
+}
+
+impl AzureClient {
+    fn new(url: Url, mut options: ClientOptions) -> anyhow::Result<Self> {
+        // Each lane owns its connection pool; cloning a transport would share it.
+        // Disable transparent decompression: stored bytes and byte ranges are exact.
+        if options.transport.is_none() {
+            options.transport = Some(azure_core::http::Transport::new(
+                azure_core::http::new_http_client(Some(azure_core::http::HttpClientOptions {
+                    automatic_decompression: false,
+                })),
             ));
         }
         let container = BlobContainerClient::new(
@@ -190,12 +229,6 @@ impl AzureStore {
         Ok(Self {
             container: Arc::new(container),
             pipeline,
-            signing,
-            delegation_key: parking_lot::Mutex::new(None),
-            sas_auth,
-            multipart_threshold: cfg.multipart_threshold.as_u64(),
-            multipart_part_size: usize::try_from(cfg.multipart_part_size.as_u64())?,
-            max_concurrent_blocks: cfg.azure.max_concurrent_blocks,
         })
     }
 
@@ -424,7 +457,8 @@ impl ObjectStore for AzureStore {
     }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
-        let mut request = Request::new(self.blob(key).url().clone(), Method::Get);
+        let client = self.data_client(key, opts.range.is_some());
+        let mut request = Request::new(client.blob(key).url().clone(), Method::Get);
         request.insert_header("x-ms-version", AZURE_API_VERSION);
         if let Some(v) = &opts.if_match {
             request.insert_header("if-match", v.as_str().to_owned());
@@ -440,7 +474,7 @@ impl ObjectStore for AzureStore {
             }
             request.insert_header("range", format!("bytes={}-{}", r.start, r.end - 1));
         }
-        let result = match self
+        let result = match client
             .pipeline
             .stream(&Context::new(), &mut request, None)
             .await
@@ -482,7 +516,7 @@ impl ObjectStore for AzureStore {
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        match self.blob(key).get_properties(None).await {
+        match self.control.blob(key).get_properties(None).await {
             Ok(r) => Ok(Some(ObjectMeta {
                 key: key.into(),
                 size: required_size(r.content_length().map_err(|e| map_error(key, &e))?)?,
@@ -532,7 +566,7 @@ impl ObjectStore for AzureStore {
             if_match: if_version.as_ref().map(etag),
             ..Default::default()
         };
-        match self.blob(key).delete(Some(options)).await {
+        match self.control.blob(key).delete(Some(options)).await {
             Ok(_) => Ok(()),
             Err(e) if status_of(&e) == Some(StatusCode::NotFound) && if_version.is_none() => Ok(()),
             Err(e)
@@ -564,7 +598,7 @@ impl ObjectStore for AzureStore {
             start_from: start_after.clone(),
             ..Default::default()
         };
-        let pager = match self.container.list_blobs(Some(options)) {
+        let pager = match self.control.container.list_blobs(Some(options)) {
             Ok(p) => p,
             Err(e) => {
                 return futures::stream::once(async move { Err(map_error(&prefix, &e)) }).boxed();
@@ -645,7 +679,7 @@ impl ObjectStore for AzureStore {
         sources: &[String],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
-        let block = self.blob(dest).block_blob_client();
+        let block = self.bulk.blob(dest).block_blob_client();
         let upload = Uuid::new_v4();
         let mut blocks = Vec::new();
         let mut total = 0u64;
@@ -655,7 +689,7 @@ impl ObjectStore for AzureStore {
                 .head(source)
                 .await?
                 .ok_or_else(|| StoreError::NotFound { key: source.into() })?;
-            let url = self.blob(source).url().to_string(); // preserves SAS and percent-encodes object keys
+            let url = self.bulk.blob(source).url().to_string(); // preserves SAS and percent-encodes object keys
             let ranges =
                 (0..meta.size).step_by(usize::try_from(part_size).map_err(StoreError::other)?);
             let start_index = blocks.len();
@@ -728,7 +762,7 @@ impl ObjectStore for AzureStore {
             resource_type: "b",
         };
         let signature = sas.sign(delegation)?;
-        let mut url = self.blob(key).url().clone();
+        let mut url = self.control.blob(key).url().clone();
         {
             let mut q = url.query_pairs_mut();
             q.clear()
@@ -755,7 +789,7 @@ impl ObjectStore for AzureStore {
     /// `Range` is not a signed header either way, so the edge may slice.
     async fn accel_target(&self, key: &str) -> Option<crate::AccelTarget> {
         let url = if self.sas_auth {
-            self.blob(key).url().to_string()
+            self.control.blob(key).url().to_string()
         } else {
             self.signed_get_url(key, std::time::Duration::from_hours(1))
                 .await
@@ -804,6 +838,7 @@ impl AzureStore {
             sas_time(expires_at)
         )));
         let response = self
+            .control
             .pipeline
             .send(&Context::new(), &mut request, None)
             .await
@@ -822,7 +857,7 @@ impl AzureStore {
         prefix: &str,
         marker: Option<&str>,
     ) -> Result<(Vec<String>, Option<String>)> {
-        let mut url = self.container.url().clone();
+        let mut url = self.control.container.url().clone();
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("restype", "container")
@@ -837,6 +872,7 @@ impl AzureStore {
         let mut request = Request::new(url, Method::Get);
         request.insert_header("x-ms-version", AZURE_API_VERSION);
         let response = self
+            .control
             .pipeline
             .send(&Context::new(), &mut request, None)
             .await
@@ -879,7 +915,7 @@ impl AzureStore {
                 .await
                 .map(|chunk| chunk.map(|chunk| (chunk, state)))
         });
-        let block = self.blob(key).block_blob_client();
+        let block = self.data_client(key, false).blob(key).block_blob_client();
         let upload = Uuid::new_v4();
         // At most concurrency parts plus one input chunk are retained. No task
         // detaches: any stream/stage failure drops outstanding requests and never commits.
@@ -929,6 +965,7 @@ impl AzureStore {
             ..Default::default()
         };
         let result = self
+            .data_client(key, false)
             .blob(key)
             .block_blob_client()
             .upload(bytes.into(), Some(options))

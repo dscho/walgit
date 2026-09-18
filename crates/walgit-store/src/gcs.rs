@@ -237,25 +237,6 @@ impl GcsStore {
         })
     }
 
-    /// Bulk keys: pack data and side-files, bundles, LFS (everything that is
-    /// large or read by range); the rest is control plane.
-    #[expect(
-        clippy::case_sensitive_file_extension_comparisons,
-        reason = "Object store control keys use exact case-sensitive suffixes"
-    )]
-    fn is_bulk_key(key: &str) -> bool {
-        // Packs and LFS are bulk; manifests, logs, checkpoints, leases and policy
-        // stay on the control transport even during a large transfer.
-        let name = key.rsplit('/').next().unwrap_or(key);
-        if name.ends_with(".pb") || name.ends_with(".json") {
-            return false;
-        }
-        key.contains("/wal/")
-            || key.starts_with("wal/")
-            || key.contains("/lfs/")
-            || key.starts_with("lfs/")
-    }
-
     /// What a resume needs (pools/creds are Arc'd inside; cheap).
     fn clone_for_resume(&self) -> BulkHttp {
         BulkHttp {
@@ -283,7 +264,7 @@ impl GcsStore {
         key: &str,
         ranged: bool,
     ) -> (&Storage, Option<tokio::sync::OwnedSemaphorePermit>) {
-        if ranged || Self::is_bulk_key(key) {
+        if ranged || crate::util::is_bulk_key(key) {
             let i = self
                 .bulk_next
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -587,7 +568,7 @@ impl GcsStore {
         key: &str,
         range: Option<std::ops::Range<u64>>,
     ) -> Result<ByteStream> {
-        if self.creds.is_some() && (range.is_some() || Self::is_bulk_key(key)) {
+        if self.creds.is_some() && (range.is_some() || crate::util::is_bulk_key(key)) {
             return Ok(self.bulk_http_read(key, range, None).await?.2);
         }
         let (client, permit) = self.data_client(key, range.is_some()).await;
@@ -718,7 +699,7 @@ impl ObjectStore for GcsStore {
 
         // Direct read (no if_none_match, or if_none_match with non-numeric
         // version that can never match a GCS generation).
-        if self.creds.is_some() && (opts.range.is_some() || Self::is_bulk_key(key)) {
+        if self.creds.is_some() && (opts.range.is_some() || crate::util::is_bulk_key(key)) {
             let if_gen = match &opts.if_match {
                 Some(v) => match parse_generation(v) {
                     Some(g) => Some(g),
@@ -1493,33 +1474,6 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod bulk_key_tests {
-    use super::GcsStore;
-
-    #[test]
-    fn control_plane_keys_are_never_bulk() {
-        for k in [
-            "prefix/repos/o/r/manifest.pb",
-            "prefix/repos/o/r/log/0000000000000001.pb",
-            "prefix/repos/o/r/checkpoints/0000000000000001/refs.pb",
-            "prefix/repos/o/r/leases/compact.pb",
-            "prefix/repos/o/r/policy.json",
-            "prefix/repos/o/r/cache/api/v1/abc.json",
-        ] {
-            assert!(!GcsStore::is_bulk_key(k), "{k} must be control plane");
-        }
-        for k in [
-            "prefix/repos/o/r/wal/abc.pack",
-            "prefix/repos/o/r/wal/abc.idx",
-            "prefix/repos/o/r/wal/abc.commit-graph",
-            "prefix/repos/o/r/lfs/objects/ab/cd/abcd",
-        ] {
-            assert!(GcsStore::is_bulk_key(k), "{k} must be bulk");
-        }
-    }
 }
 
 #[cfg(test)]

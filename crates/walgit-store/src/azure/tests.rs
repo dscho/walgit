@@ -16,7 +16,7 @@ use std::fmt;
 use std::fmt::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify, Semaphore};
 
 // The SDK owns auth, retries and serialization in these tests. Only the HTTP
 // transport is substituted, so the actual requests can be asserted precisely.
@@ -39,10 +39,9 @@ impl HttpClient for FakeClient {
     }
 }
 
-fn fixture<F, Fut>(
+fn client_options<F, Fut>(
     reply: F,
-    credential: Option<Arc<dyn TokenCredential>>,
-) -> (AzureStore, Arc<Mutex<Vec<Request>>>)
+) -> (ClientOptions, Arc<Mutex<Vec<Request>>>)
 where
     F: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = azure_core::Result<AsyncRawResponse>> + Send + 'static,
@@ -52,6 +51,36 @@ where
         calls: calls.clone(),
         reply: Box::new(move |r| reply(r).boxed()),
     };
+    (
+        ClientOptions {
+            transport: Some(Transport::new(Arc::new(client))),
+            retry: RetryOptions::none(),
+            ..Default::default()
+        },
+        calls,
+    )
+}
+
+fn fixture<F, Fut>(
+    reply: F,
+    credential: Option<Arc<dyn TokenCredential>>,
+) -> (AzureStore, Arc<Mutex<Vec<Request>>>)
+where
+    F: Fn(Request) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = azure_core::Result<AsyncRawResponse>> + Send + 'static,
+{
+    let (options, calls) = client_options(reply);
+    (
+        fixture_with_options(credential, options.clone(), options),
+        calls,
+    )
+}
+
+fn fixture_with_options(
+    credential: Option<Arc<dyn TokenCredential>>,
+    control: ClientOptions,
+    bulk: ClientOptions,
+) -> AzureStore {
     let cfg = StoreConfig {
         bucket: "container".into(),
         multipart_threshold: bytesize::ByteSize::b(0),
@@ -67,18 +96,7 @@ where
     if credential.is_none() {
         url.set_query(Some("sig=synthetic-sas"));
     }
-    let store = AzureStore::with_client_options(
-        &cfg,
-        url,
-        credential,
-        ClientOptions {
-            transport: Some(Transport::new(Arc::new(client))),
-            retry: RetryOptions::none(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    (store, calls)
+    AzureStore::with_client_options(&cfg, url, credential, control, bulk).unwrap()
 }
 
 fn response(
@@ -107,6 +125,167 @@ fn query(r: &Request, name: &str) -> Option<String> {
         .query_pairs()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.into_owned())
+}
+
+#[tokio::test]
+async fn bulk_transfers_do_not_block_control_requests_or_duplicate_authentication() {
+    fn reply(r: &Request) -> AsyncRawResponse {
+        match (r.method(), query(r, "comp").as_deref()) {
+            (Method::Get, Some("list")) => response(
+                StatusCode::Ok,
+                "<EnumerationResults><Blobs/><NextMarker/></EnumerationResults>",
+                &[],
+            ),
+            (Method::Post, Some("userdelegationkey")) => response(
+                StatusCode::Ok,
+                delegation_key_xml(&sas_time(OffsetDateTime::now_utc() + Duration::hours(2))),
+                &[],
+            ),
+            (Method::Get, _) if header(r, "range").is_some() => response(
+                StatusCode::PartialContent,
+                "x",
+                &[("etag", "\"version\""), ("content-range", "bytes 0-0/3")],
+            ),
+            (Method::Get | Method::Head, _) => response(
+                StatusCode::Ok,
+                "xyz",
+                &[("etag", "\"version\""), ("content-length", "3")],
+            ),
+            (Method::Put, _) => ok(),
+            (Method::Delete, _) => response(StatusCode::Accepted, "", &[]),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Semaphore::new(0));
+    let (control, control_calls) = client_options(|r| async move { Ok(reply(&r)) });
+    let entered = started.clone();
+    let gate = release.clone();
+    let (bulk, bulk_calls) = client_options(move |r| {
+        let entered = entered.clone();
+        let gate = gate.clone();
+        async move {
+            entered.notify_one();
+            let _permit = gate.acquire().await.unwrap();
+            Ok(reply(&r))
+        }
+    });
+    let credential = Arc::new(FixedCredential::default());
+    let mut store = fixture_with_options(Some(credential.clone()), control, bulk);
+    store.multipart_threshold = 8;
+    let bulk_keys = [
+        "repos/o/r/wal/abc.pack",
+        "repos/o/r/wal/abc.idx",
+        "repos/o/r/lfs/objects/ab/cd/abcd",
+    ];
+
+    let (upload, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            store.put(
+                bulk_keys[0],
+                Bytes::from_static(b"123456789").into(),
+                PutMode::Create.into(),
+            ),
+            async {
+                started.notified().await;
+                for key in [
+                    "repos/o/r/manifest.pb",
+                    "repos/o/r/wal/descriptor.pb",
+                    "repos/o/r/cache/api/v1/abc.json",
+                ] {
+                    let (meta, _) = store
+                        .get(key, GetOptions::default())
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    store
+                        .put(
+                            key,
+                            Bytes::from_static(b"x").into(),
+                            PutMode::Update(meta.version).into(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                for key in bulk_keys {
+                    assert!(store.head(key).await.unwrap().is_some());
+                    store.delete(key, None).await.unwrap();
+                }
+                assert!(
+                    store
+                        .list("repos/", None)
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(store.list_prefixes("repos/").await.unwrap().is_empty());
+                assert!(
+                    store
+                        .signed_get_url(bulk_keys[0], std::time::Duration::from_mins(1))
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                release.add_permits(1);
+            }
+        )
+    })
+    .await
+    .expect("control requests must finish while the bulk transport is blocked");
+    assert_eq!(upload.unwrap().size, 9);
+
+    for key in bulk_keys {
+        store
+            .get(key, GetOptions::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        store
+            .put(
+                key,
+                Bytes::from_static(b"x").into(),
+                PutMode::Create.into(),
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .get(
+            "arbitrary",
+            GetOptions {
+                range: Some(0..1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    store
+        .compose("composed", &["source".into()], PutMode::Create.into())
+        .await
+        .unwrap();
+
+    assert_eq!(credential.calls.load(Ordering::SeqCst), 1);
+    let control_calls = control_calls.lock().unwrap();
+    let bulk_calls = bulk_calls.lock().unwrap();
+    assert_eq!(control_calls.len(), 16);
+    assert_eq!(bulk_calls.len(), 13);
+    let authorization = header(&control_calls[0], "authorization").unwrap();
+    assert!(
+        control_calls
+            .iter()
+            .chain(bulk_calls.iter())
+            .all(|r| header(r, "authorization") == Some(authorization))
+    );
 }
 
 #[test]
@@ -667,8 +846,10 @@ async fn small_file_and_stream_bodies_are_one_request() {
     );
 }
 
-#[derive(Debug)]
-struct FixedCredential;
+#[derive(Debug, Default)]
+struct FixedCredential {
+    calls: AtomicUsize,
+}
 #[async_trait]
 impl TokenCredential for FixedCredential {
     async fn get_token(
@@ -676,6 +857,7 @@ impl TokenCredential for FixedCredential {
         _: &[&str],
         _: Option<TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(AccessToken::new(
             "synthetic-token",
             OffsetDateTime::now_utc() + Duration::hours(1),
@@ -711,7 +893,7 @@ async fn signed_urls_are_user_delegation_sas_from_one_cached_key() {
                 Ok(response(StatusCode::Ok, body, &[]))
             }
         },
-        Some(Arc::new(FixedCredential)),
+        Some(Arc::new(FixedCredential::default())),
     );
     let ttl = std::time::Duration::from_mins(30);
     let url = store
@@ -793,7 +975,8 @@ async fn signing_is_off_under_sas_auth_or_without_an_account() {
     let store = AzureStore::with_client_options(
         &cfg,
         container_url(&cfg, None).unwrap(),
-        Some(Arc::new(FixedCredential)),
+        Some(Arc::new(FixedCredential::default())),
+        ClientOptions::default(),
         ClientOptions::default(),
     )
     .unwrap();
@@ -823,7 +1006,7 @@ async fn the_edge_gets_a_credentialed_url_and_no_header_under_either_auth() {
             let body = delegation_key_xml(&key_expiry);
             async move { Ok(response(StatusCode::Ok, body, &[])) }
         },
-        Some(Arc::new(FixedCredential)),
+        Some(Arc::new(FixedCredential::default())),
     );
     let target = store.accel_target("repos/o/r/bundle").await.unwrap();
     assert!(target.authorization.is_none());
