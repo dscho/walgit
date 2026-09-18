@@ -155,8 +155,8 @@ test-gcs bucket:
     WALGIT_TEST_GCS_BUCKET={{bucket}} cargo test -p walgit-store --features gcs --test contract -- gcs_contract --nocapture
 
 # Isolated Azure contract + Git push/clone/pull/cold-restart, no cloud credentials.
-# Requires Docker (or WALGIT_TEST_CONTAINER_RUNTIME=podman) and the fixture SDK:
-#   uv (the fixture declares its pinned SDK dependency)
+# Requires uv and Docker/Podman, or a local Azurite 3.37.0 executable:
+#   WALGIT_TEST_AZURITE=azurite-blob just test-azure
 test-azure:
     {{t15}} uv run --script tests/azure-store.py
 

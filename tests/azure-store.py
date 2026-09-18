@@ -5,7 +5,9 @@
 # ///
 """Isolated Azurite contract + real Git push/clone/pull/cold-restart smoke.
 
-Requires Docker (or WALGIT_TEST_CONTAINER_RUNTIME=podman), cargo, git, and
+Requires Docker (or WALGIT_TEST_CONTAINER_RUNTIME=podman), or a local
+Azurite 3.37.0 executable selected with WALGIT_TEST_AZURITE=azurite-blob;
+also cargo, git, and
 `uv run --script tests/azure-store.py`. The Azure SDK is used only
 to create the test container and mint a SAS from a synthetic emulator key.
 No Azure account, existing container or developer credential is used.
@@ -38,6 +40,15 @@ def run(args, *, env=None, cwd=ROOT, timeout=600, capture=False):
                           text=True, capture_output=capture)
 
 
+def stop_process(process):
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 @contextlib.contextmanager
 def server(binary, config, env, url, log_path):
     with log_path.open("w") as log:
@@ -57,12 +68,7 @@ def server(binary, config, env, url, log_path):
                 raise RuntimeError("walgit startup timed out:\n" + log_path.read_text())
             yield
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            stop_process(process)
 
 
 def git_smoke(env, endpoint):
@@ -139,7 +145,27 @@ max_bytes = "128MiB"
     print("Azure Git smoke passed", flush=True)
 
 
-def main():
+@contextlib.contextmanager
+def azurite():
+    executable = os.environ.get("WALGIT_TEST_AZURITE")
+    if executable:
+        binary = shutil.which(executable)
+        if binary is None:
+            raise RuntimeError(f"Azurite executable not found: {executable}")
+        with tempfile.TemporaryDirectory(prefix="walgit-azurite-") as directory:
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            process = subprocess.Popen([
+                binary, "--blobHost", "127.0.0.1", "--blobPort", str(port),
+                "--location", directory, "--disableProductStyleUrl",
+                "--disableTelemetry", "--silent",
+            ], env=dict(os.environ, AZURITE_ACCOUNTS=f"{ACCOUNT}:{KEY}"))
+            try:
+                yield f"http://127.0.0.1:{port}/{ACCOUNT}"
+            finally:
+                stop_process(process)
+        return
     runtime = os.environ.get("WALGIT_TEST_CONTAINER_RUNTIME", "docker")
     if shutil.which(runtime) is None:
         raise RuntimeError(f"{runtime} is required for the isolated Azurite test")
@@ -149,7 +175,13 @@ def main():
              "--publish", "127.0.0.1::10000", "--env", f"AZURITE_ACCOUNTS={ACCOUNT}:{KEY}",
              IMAGE, "azurite-blob", "--blobHost", "0.0.0.0", "--disableProductStyleUrl"], timeout=180)
         address = run([runtime, "port", name, "10000/tcp"], capture=True).stdout.strip().splitlines()[0]
-        endpoint = f"http://{address}/{ACCOUNT}"
+        yield f"http://{address}/{ACCOUNT}"
+    finally:
+        subprocess.run([runtime, "rm", "--force", name], capture_output=True, timeout=30, check=False)
+
+
+def main():
+    with azurite() as endpoint:
         client = BlobServiceClient(endpoint, credential=KEY, retry_total=0, connection_timeout=1)
         # A cold container runtime can take well over ten seconds to start Node.
         for _ in range(600):
@@ -169,8 +201,6 @@ def main():
         run(["cargo", "test", "--locked", "-p", "walgit-store", "--features", "azure",
              "--test", "contract", "azure_contract", "--", "--nocapture"], env=env)
         git_smoke(env, endpoint)
-    finally:
-        subprocess.run([runtime, "rm", "--force", name], capture_output=True, timeout=30, check=False)
 
 
 if __name__ == "__main__":

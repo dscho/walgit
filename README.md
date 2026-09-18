@@ -164,7 +164,7 @@ just clippy        # the [workspace.lints] set across all targets, warnings are 
 just ci            # warnings, clippy, test, e2e: everything that must be green before a merge
 cargo test -p walgit-server --test sim     # fault-injection simulation (crashes, partitions, stale reads)
 just test-s3       # store contract against local rustfs
-just test-azure    # isolated Azurite contract + Git push/clone/pull/cold restart (Docker or Podman + uv)
+just test-azure    # isolated Azurite contract + Git smoke (uv; Docker/Podman or WALGIT_TEST_AZURITE=azurite-blob)
 ```
 
 Code map:
