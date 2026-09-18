@@ -758,6 +758,49 @@ async fn azure_contract() {
         .expect("file bytes")
         .expect("object");
     assert_eq!(&got[..], &data);
+    let race_key = format!("{prefix}/wal/create-race.pack");
+    let start = Arc::new(tokio::sync::Barrier::new(8));
+    let len = data.len();
+    let results = futures::future::join_all((0u8..8).map(|byte| {
+        let store = store.clone();
+        let key = race_key.clone();
+        let start = start.clone();
+        async move {
+            let body = Bytes::from(vec![byte; len]);
+            start.wait().await;
+            (byte, store.put(&key, body.into(), PutMode::Create.into()).await)
+        }
+    }))
+    .await;
+    let mut winner = None;
+    for (byte, result) in results {
+        match result {
+            Ok(meta) => assert!(
+                winner.replace((byte, meta)).is_none(),
+                "multipart Create must have exactly one winner"
+            ),
+            Err(error) => assert!(
+                error.is_precondition_failed(),
+                "losing multipart Create must fail its precondition: {error}"
+            ),
+        }
+    }
+    let (byte, winner) = winner.expect("one multipart Create must succeed");
+    let (meta, got) = store
+        .get(&race_key, GetOptions::default())
+        .await
+        .expect("read multipart winner")
+        .bytes()
+        .await
+        .expect("read winner body")
+        .expect("winner exists");
+    assert_eq!(meta.version, winner.version);
+    assert_eq!(meta.size, len as u64);
+    assert_eq!(got.len(), len);
+    assert!(
+        got.iter().all(|&value| value == byte),
+        "multipart winner must not contain another writer's blocks"
+    );
     for leaf in ["a&b/one", "a&b/two", "z/one"] {
         store
             .put(
