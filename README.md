@@ -165,7 +165,14 @@ just ci            # warnings, clippy, test, e2e: everything that must be green 
 cargo test -p walgit-server --test sim     # fault-injection simulation (crashes, partitions, stale reads)
 just test-s3       # store contract against local rustfs
 just test-azure    # isolated Azurite contract + Git smoke (uv; Docker/Podman or WALGIT_TEST_AZURITE=azurite-blob)
+uv run --script tests/azure-store.py --account exampleaccount --container examplecontainer
 ```
+
+Replace the example names. Live Azure mode requires an existing private container,
+`az login` in the correct tenant, and Storage Blob Data Contributor at storage-account
+scope (including delegation-key permission). Unset `AZURE_STORAGE_SAS_TOKEN`. It
+provisions no cloud resources and needs no Docker/Azurite. Contract objects are cleaned
+up; the Git smoke repository is retained under its printed unique prefix.
 
 Code map:
 

@@ -683,17 +683,35 @@ async fn azure_contract() {
         eprintln!("skipping azure_contract: WALGIT_TEST_AZURE_ENDPOINT not set");
         return;
     };
+    let account = match std::env::var("WALGIT_TEST_AZURE_ACCOUNT") {
+        Ok(account) => account,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(error) => panic!("invalid Azure test account: {error}"),
+    };
+    let identity = !account.is_empty();
     let cfg = walgit_config::StoreConfig {
         backend: walgit_config::StoreBackend::Azure,
         bucket: std::env::var("WALGIT_TEST_AZURE_CONTAINER").expect("Azure test container"),
         azure: walgit_config::AzureConfig {
+            account,
             endpoint,
+            credential: if identity {
+                walgit_config::AzureCredential::AzureCli
+            } else {
+                walgit_config::AzureCredential::Auto
+            },
             ..Default::default()
         },
         multipart_threshold: bytesize::ByteSize::mib(5),
         multipart_part_size: bytesize::ByteSize::mib(5),
         ..Default::default()
     };
+    if identity {
+        assert!(
+            std::env::var_os(&cfg.azure.sas_token_env).is_none(),
+            "unset the configured SAS token to test Azure CLI identity"
+        );
+    }
     let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
     let store: DynStore =
         Arc::new(walgit_store::azure::AzureStore::new(&cfg).expect("AzureStore::new"));
@@ -830,15 +848,88 @@ async fn azure_contract() {
         .await
         .expect("empty compose");
     assert_eq!(empty.size, 0);
-    // Under SAS-token auth (the emulator path) no user delegation key exists to
-    // sign with, so LFS URLs fall back to the proxy.
-    assert!(
-        store
-            .signed_get_url(&key, std::time::Duration::from_mins(1))
+    let signed = store
+        .signed_get_url(&key, std::time::Duration::from_mins(1))
+        .await
+        .expect("signed URL");
+    if identity {
+        let url = signed.expect("Azure CLI identity must issue a user-delegation SAS");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("signed URL client");
+        for method in [reqwest::Method::HEAD, reqwest::Method::GET] {
+            let response = client
+                .request(method.clone(), &url)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .expect("signed read");
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-length")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+                data.len() as u64
+            );
+            assert_eq!(
+                response.headers().get("etag").unwrap().to_str().unwrap(),
+                next.version.as_str()
+            );
+            if method == reqwest::Method::GET {
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(reqwest::Error::without_url)
+                    .expect("signed body");
+                assert!(body.as_ref() == data, "signed GET must preserve all bytes");
+            }
+        }
+        let response = client
+            .get(&url)
+            .header("range", "bytes=2-4")
+            .send()
             .await
-            .expect("signing under sas auth")
-            .is_none()
-    );
+            .map_err(reqwest::Error::without_url)
+            .expect("signed range");
+        assert_eq!(response.status().as_u16(), 206);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 2-4/{}", data.len())
+        );
+        let body = response
+            .bytes()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .expect("signed range body");
+        assert_eq!(body.as_ref(), &data[2..5]);
+        let response = client
+            .put(&url)
+            .header("x-ms-blob-type", "BlockBlob")
+            .body("must-not-replace")
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .expect("read-only SAS write rejection");
+        assert_eq!(response.status().as_u16(), 403);
+        assert_eq!(
+            store.head(&key).await.unwrap().unwrap().version,
+            next.version
+        );
+    } else {
+        assert!(signed.is_none(), "SAS auth must retain proxy fallback");
+    }
 
     let remaining: Vec<_> = store.list(&prefix, None).collect().await;
     for entry in remaining {
@@ -953,6 +1044,7 @@ async fn gcs_contract() {
 /// 1 GiB of a big object as 32 parallel 32 MiB ranges (bulk clients + permits)
 /// while timing small control-plane calls every 250 ms; every small call must
 /// stay under 2 s. `WALGIT_TEST_GCS_BUCKET=walgit-store WALGIT_TEST_GCS_BIG_KEY=<key under prefix>`.
+#[cfg(feature = "gcs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gcs_control_plane_not_starved_by_bulk() {
     const CHUNK: u64 = 32 * 1024 * 1024;

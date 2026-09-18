@@ -3,18 +3,25 @@
 # requires-python = ">=3.11"
 # dependencies = ["azure-storage-blob==12.30.1"]
 # ///
-"""Isolated Azurite contract + real Git push/clone/pull/cold-restart smoke.
+"""Azurite or live Azure contract + Git push/clone/pull/cold-restart smoke.
 
 Requires Docker (or WALGIT_TEST_CONTAINER_RUNTIME=podman), or a local
 Azurite 3.37.0 executable selected with WALGIT_TEST_AZURITE=azurite-blob;
 also cargo, git, and
 `uv run --script tests/azure-store.py`. The Azure SDK is used only
 to create the test container and mint a SAS from a synthetic emulator key.
-No Azure account, existing container or developer credential is used.
+Without arguments, no Azure account or developer credential is used.
+For an existing Azure container, pass --account NAME --container NAME.
+Live mode uses the Azure CLI login and requires account-scoped Blob Data
+Contributor access and an unset AZURE_STORAGE_SAS_TOKEN. It leaves the
+container and its uniquely prefixed Git repository in place.
 """
+import argparse
 import base64
 import contextlib
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -73,6 +80,10 @@ def server(binary, config, env, url, log_path):
 
 def git_smoke(env, endpoint):
     print("Azure Git smoke: push, clone, change, pull, and clone from a cold server", flush=True)
+    account = env.get("WALGIT_TEST_AZURE_ACCOUNT", "")
+    credential = "azure_cli" if account else "auto"
+    prefix = "git-smoke/" + uuid4().hex + "/"
+    print(f"Azure Git smoke prefix: {prefix}", flush=True)
     run(["cargo", "build", "--locked", "-p", "walgit-cli", "--bin", "walgit-server",
          "--features", "walgit-store/azure"], env=env, timeout=900)
     target = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
@@ -102,12 +113,14 @@ roles = ["serve"]
 mode = "none"
 [store]
 backend = "azure"
-bucket = "{CONTAINER}"
-prefix = "git-smoke/"
+bucket = {json.dumps(env["WALGIT_TEST_AZURE_CONTAINER"])}
+prefix = "{prefix}"
 multipart_threshold = "1MiB"
 multipart_part_size = "256KiB"
 [store.azure]
-endpoint = "{endpoint}"
+endpoint = {json.dumps(endpoint)}
+account = {json.dumps(account)}
+credential = "{credential}"
 [cache]
 dir = "{cache}"
 mode = "budget"
@@ -180,7 +193,33 @@ def azurite():
         subprocess.run([runtime, "rm", "--force", name], capture_output=True, timeout=30, check=False)
 
 
+def check_backend(env):
+    run(["cargo", "test", "--locked", "-p", "walgit-store", "--features", "azure", "--lib"], env=env)
+    run(["cargo", "test", "--locked", "-p", "walgit-store", "--features", "azure",
+         "--test", "contract", "azure_contract", "--", "--nocapture"], env=env)
+    git_smoke(env, env["WALGIT_TEST_AZURE_ENDPOINT"])
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--account", help="Existing live Azure storage account (Azure CLI identity)")
+    parser.add_argument("--container", help="Existing container in that account")
+    args = parser.parse_args()
+    if (args.account is None) != (args.container is None):
+        parser.error("--account and --container must be supplied together")
+    if args.account is not None:
+        if not re.fullmatch(r"[a-z0-9]{3,24}", args.account):
+            parser.error("--account must be a valid Azure storage account name")
+        if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", args.container)
+                or "--" in args.container):
+            parser.error("--container must be a valid Azure container name")
+        if "AZURE_STORAGE_SAS_TOKEN" in os.environ:
+            parser.error("unset AZURE_STORAGE_SAS_TOKEN to test Azure CLI identity")
+        env = dict(os.environ, WALGIT_TEST_AZURE_ACCOUNT=args.account,
+                   WALGIT_TEST_AZURE_CONTAINER=args.container,
+                   WALGIT_TEST_AZURE_ENDPOINT=f"https://{args.account}.blob.core.windows.net")
+        check_backend(env)
+        return
     with azurite() as endpoint:
         client = BlobServiceClient(endpoint, credential=KEY, retry_total=0, connection_timeout=1)
         # A cold container runtime can take well over ten seconds to start Node.
@@ -196,11 +235,9 @@ def main():
                                     permission=ContainerSasPermissions(read=True, write=True, delete=True, list=True, create=True),
                                     expiry=datetime.now(timezone.utc) + timedelta(hours=2))
         env = dict(os.environ, WALGIT_TEST_AZURE_ENDPOINT=endpoint,
+                   WALGIT_TEST_AZURE_ACCOUNT="",
                    WALGIT_TEST_AZURE_CONTAINER=CONTAINER, AZURE_STORAGE_SAS_TOKEN=sas)
-        run(["cargo", "test", "--locked", "-p", "walgit-store", "--features", "azure", "--lib"], env=env)
-        run(["cargo", "test", "--locked", "-p", "walgit-store", "--features", "azure",
-             "--test", "contract", "azure_contract", "--", "--nocapture"], env=env)
-        git_smoke(env, endpoint)
+        check_backend(env)
 
 
 if __name__ == "__main__":
