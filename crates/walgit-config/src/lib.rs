@@ -143,6 +143,9 @@ pub enum Role {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub mode: AuthMode,
+    /// Permit `none` authentication on non-loopback listeners. Every reachable
+    /// client gets read, write and admin access.
+    pub allow_unauthenticated_network: bool,
     /// Allow unauthenticated read (upload-pack, LFS, web UI) when mode != none.
     pub anonymous_read: bool,
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
@@ -200,7 +203,8 @@ pub const ACCESS_TOKEN_PREFIX: &str = "wgt_";
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
     /// Everyone is `anon` with write **and admin**. `Config::validate` refuses this
-    /// unless `server.listen` is loopback.
+    /// unless `server.listen` is loopback or
+    /// [`AuthConfig::allow_unauthenticated_network`] is enabled.
     #[default]
     None,
     /// Static tokens from the config (`tokens`), bearer or basic.
@@ -850,6 +854,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         AuthConfig {
             mode: AuthMode::None,
+            allow_unauthenticated_network: false,
             anonymous_read: true,
             tokens: vec![],
             issuer: String::new(),
@@ -1221,8 +1226,8 @@ impl Config {
         let a = &self.server.auth;
         if a.mode == AuthMode::None {
             anyhow::ensure!(
-                self.server.listen.ip().is_loopback(),
-                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
+                self.server.listen.ip().is_loopback() || a.allow_unauthenticated_network,
+                "server.auth.mode = none is loopback-only by default (listen is {}); use token or oidc, or explicitly set server.auth.allow_unauthenticated_network = true",
                 self.server.listen
             );
         }
@@ -1709,6 +1714,60 @@ audiences = ["walgit-cli", "https://git.example.com"]
         assert_eq!(none.server.auth.issuer, "");
         let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
         assert_eq!(tok.server.auth.issuer, "");
+    }
+
+    #[test]
+    fn unauthenticated_network_requires_explicit_opt_in() {
+        for listen in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "192.168.1.2:8080",
+            "192.0.2.10:8080",
+            "[2001:db8::1]:8080",
+        ] {
+            let config = format!("[server]\nlisten = \"{listen}\"\n[server.auth]\nmode = \"none\"\n");
+            for opt_in in ["", "allow_unauthenticated_network = false\n"] {
+                let err = Config::parse(&format!("{config}{opt_in}")).unwrap_err();
+                assert!(
+                    err.to_string().contains("allow_unauthenticated_network"),
+                    "{err}"
+                );
+            }
+            let enabled =
+                Config::parse(&format!("{config}allow_unauthenticated_network = true\n")).unwrap();
+            assert!(enabled.server.auth.allow_unauthenticated_network);
+        }
+        for listen in ["127.0.0.1:8080", "[::1]:8080"] {
+            let cfg = Config::parse(&format!("[server]\nlisten = \"{listen}\"\n")).unwrap();
+            assert!(!cfg.server.auth.allow_unauthenticated_network);
+        }
+    }
+
+    #[test]
+    fn unauthenticated_network_opt_in_preserves_other_auth_validation() {
+        for (mode, required) in [("token", "tokens"), ("oidc", "issuer")] {
+            let err = Config::parse(&format!(
+                "[server]\nlisten = \"0.0.0.0:8080\"\n[server.auth]\nmode = \"{mode}\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\nallow_unauthenticated_network = true\n"
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains(required), "{err}");
+        }
+    }
+
+    #[test]
+    fn environment_can_enable_unauthenticated_network() {
+        let mut cfg = Config::default();
+        cfg.apply_env(
+            [
+                ("WALGIT__SERVER__LISTEN", "192.0.2.10:8080"),
+                ("WALGIT__SERVER__AUTH__ALLOW_UNAUTHENTICATED_NETWORK", "true"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+        )
+        .unwrap();
+        assert!(cfg.server.auth.allow_unauthenticated_network);
+        cfg.validate().unwrap();
     }
 
     #[test]

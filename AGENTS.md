@@ -76,7 +76,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   client: SSE envelope for the web UI, sideband band-2 lines for git. "Cloning into… and then nothing" is a bug.
 
 ### 1.3 Security contract (`Config::validate` fails closed)
-- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback),
+- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses non-loopback listeners unless `server.auth.allow_unauthenticated_network` is explicitly enabled; default false),
   **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
@@ -487,6 +487,12 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
+
+- **D50 (2026-09-20): Explicit unauthenticated network access.** Non-loopback `none` requires
+  operator opt-in through `server.auth.allow_unauthenticated_network`; default false preserves
+  loopback-only protection. Do not infer trust from WSL or private addresses. Warn at startup
+  on an unauthenticated network bind: every reachable client gets read/write/admin access.
+  The flag is not a peer filter or firewall; token and OIDC validation are unchanged.
 
 ## 5. Working rules
 

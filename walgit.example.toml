@@ -5,7 +5,7 @@
 # Validate with: walgit --config walgit.toml config check
 
 [server]
-listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
+listen = "127.0.0.1:8080"        # default; mode = none is loopback-only unless explicitly opted in below
 http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
 max_concurrent_requests = 512     # global cap on in-flight git requests
 max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
@@ -38,10 +38,12 @@ mode = "off"                      # "off" (HTTP/1.1 + h2c) | "self_signed" (gene
 
 [server.auth]
 mode = "none"                     # "none" | "token" | "oidc"
-                                  #   none  — everyone is `anon` with write+admin; loopback listen only
+                                  #   none  — everyone is `anon` with write+admin; loopback by default
                                   #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
                                   #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
                                   #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
+allow_unauthenticated_network = false # allow non-loopback mode = none; every reachable client gets read/write/admin
+                                     # This is not a peer filter or firewall.
 anonymous_read = true             # must be false in oidc mode
 # tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
 #   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },

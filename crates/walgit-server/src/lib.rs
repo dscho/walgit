@@ -560,6 +560,11 @@ pub async fn serve(
     let app = router(state);
     let listener = TcpAccept::bind(addr).await?;
     let tls = state_for_shutdown.tls.clone();
+    if state_for_shutdown.cfg.server.auth.mode == walgit_config::AuthMode::None
+        && !addr.ip().is_loopback()
+    {
+        tracing::warn!(%addr, "authentication is disabled on a network listener; every reachable client has read/write/admin access");
+    }
     tracing::info!(%addr, addrs = ?listener.addrs(), tls = tls.is_some(), url = %listen_url(&state_for_shutdown.cfg), "walgit-server listening");
 
     let st = state_for_shutdown.clone();

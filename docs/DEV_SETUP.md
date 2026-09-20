@@ -61,6 +61,30 @@ An explicit endpoint override instead uses a store you have already started.
 The checked-in standalone TOML still defaults to port 9000 when invoked directly.
 Stop the compose services with `just dev-store-stop`; it does not delete volumes.
 
+## Password-free VM access
+
+When connecting through a VM's network address rather than loopback, explicitly
+opt in to unauthenticated network access. For example, Windows browsers can use
+a WSL guest's actual `eth0` IPv4 address. Replace `192.0.2.10` below with that
+address, preferring a specific interface address to `0.0.0.0`.
+
+```toml
+[server]
+listen = "192.0.2.10:8080"
+
+[server.auth]
+mode = "none"
+allow_unauthenticated_network = true
+```
+
+Open `http://<guest-ip>:8080/` in the Windows browser, using the same guest
+address. Every reachable client gets read/write/admin access; enable this only
+when that is intended. The flag is not a peer filter or firewall. Its default
+remains `false`, keeping `none` loopback-only without explicit opt-in.
+
+This runs the Linux server under WSL; native Windows server operation remains
+unqualified.
+
 ## Validate
 
 ```sh
