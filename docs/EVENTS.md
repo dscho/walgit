@@ -128,6 +128,43 @@ Authentication can use a
 [static secret `Authorization` delivery header](https://learn.microsoft.com/en-us/azure/event-grid/delivery-properties)
 or a compatible existing OIDC setup; Entra ID is not required. Query-string credentials are not accepted.
 
+## Azure queue smoke (opt-in)
+
+The opt-in `--event-grid-queue` mode verifies actual Blob -> Event Grid -> Queue -> local authenticated
+handler -> WAL webhook/cursor delivery. This is a test relay, not a production queue consumer.
+Normal Azurite/live backend modes remain unchanged.
+
+Use a StorageV2 account with the [live Azure prerequisites](../README.md), a dedicated queue, and a system topic with a
+system-assigned identity. Grant that identity Storage Queue Data Message Sender at storage-account
+scope, following [Microsoft's setup](https://learn.microsoft.com/en-us/azure/event-grid/managed-service-identity#use-the-azure-cli---azure-storage-queue).
+The local Azure CLI user also needs Storage Queue Data Message Processor on the queue.
+Shared keys are unnecessary; unset `AZURE_STORAGE_SAS_TOKEN`.
+
+Configure two [queue-delivery subscriptions](https://learn.microsoft.com/en-us/azure/event-grid/handler-storage-queues)
+using the topic identity. Both filter to `Microsoft.Storage.BlobCreated` and subject suffix
+`/manifest.pb`, with these disjoint subject prefixes:
+
+- `EventGridSchema`: `/blobServices/default/containers/<container>/blobs/event-grid-smoke/native/`
+- `CloudEventSchemaV1_0`: `/blobServices/default/containers/<container>/blobs/event-grid-smoke/cloud/`
+
+Wait for both subscriptions to reach `Succeeded`, then run:
+
+```sh
+uv run --script tests/azure-store.py \
+  --account exampleaccount --container examplecontainer \
+  --event-grid-queue examplequeue
+```
+
+The fixture prints unique store prefixes and pushes two commits per schema. It matches notifications
+by exact subject and manifest ETag, so an earlier creation cannot stand in for an overwrite notification.
+After decoding the queue's base64 transport, it relays the original JSON bytes with a random local
+bearer and checks emitted OIDs, string-valued `_walgit.seq`, durable cursors and duplicate handling.
+Sweeping is disabled. Only this run's manifest messages are acknowledged; unrelated messages are not
+deleted. Azure resources and Git/WAL data are retained.
+
+Both test servers stay on loopback. This does **not** qualify Azure's direct-webhook HTTPS delivery
+or subscription-validation handshakes; separate local tests cover the POST and OPTIONS handlers.
+
 ## Consumer checklist
 
 1. Verify `X-Walgit-Signature` (if you set a secret), then parse the array.

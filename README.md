@@ -174,6 +174,8 @@ scope (including delegation-key permission). Unset `AZURE_STORAGE_SAS_TOKEN`. It
 provisions no cloud resources and needs no Docker/Azurite. Contract objects are cleaned
 up; the Git smoke repository is retained under its printed unique prefix.
 
+For the opt-in Event Grid queue test, see [Azure queue smoke](docs/EVENTS.md#azure-queue-smoke-opt-in).
+
 Code map:
 
 ```

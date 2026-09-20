@@ -15,6 +15,8 @@ For an existing Azure container, pass --account NAME --container NAME.
 Live mode uses the Azure CLI login and requires account-scoped Blob Data
 Contributor access and an unset AZURE_STORAGE_SAS_TOKEN. It leaves the
 container and its uniquely prefixed Git repository in place.
+For real Event Grid delivery, also pass --event-grid-queue NAME;
+see docs/EVENTS.md for the required subscriptions and queue permissions.
 """
 import argparse
 import base64
@@ -22,13 +24,18 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from email.utils import formatdate
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from uuid import uuid4
 
@@ -78,18 +85,22 @@ def server(binary, config, env, url, log_path):
             stop_process(process)
 
 
+def build_server(env):
+    run(["cargo", "build", "--locked", "-p", "walgit-cli", "--bin", "walgit-server",
+         "--features", "walgit-store/azure"], env=env, timeout=900)
+    target = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
+    if not target.is_absolute():
+        target = ROOT / target
+    return target / "debug" / "walgit-server"
+
+
 def git_smoke(env, endpoint):
     print("Azure Git smoke: push, clone, change, pull, and clone from a cold server", flush=True)
     account = env.get("WALGIT_TEST_AZURE_ACCOUNT", "")
     credential = "azure_cli" if account else "auto"
     prefix = "git-smoke/" + uuid4().hex + "/"
     print(f"Azure Git smoke prefix: {prefix}", flush=True)
-    run(["cargo", "build", "--locked", "-p", "walgit-cli", "--bin", "walgit-server",
-         "--features", "walgit-store/azure"], env=env, timeout=900)
-    target = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
-    if not target.is_absolute():
-        target = ROOT / target
-    binary = target / "debug" / "walgit-server"
+    binary = build_server(env)
     with tempfile.TemporaryDirectory(prefix="walgit-azure-git-") as temp:
         directory = Path(temp)
         env = dict(env, GIT_CONFIG_GLOBAL=str(directory / "gitconfig"),
@@ -158,6 +169,176 @@ max_bytes = "128MiB"
     print("Azure Git smoke passed", flush=True)
 
 
+def event_grid_smoke(env, queue):
+    binary = build_server(env)
+    account = env["WALGIT_TEST_AZURE_ACCOUNT"]
+    container = env["WALGIT_TEST_AZURE_CONTAINER"]
+    endpoint = env["WALGIT_TEST_AZURE_ENDPOINT"]
+    captured = []
+
+    class Sink(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def do_POST(self):
+            captured.extend(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+
+    with tempfile.TemporaryDirectory(prefix="walgit-event-grid-") as temp:
+        directory = Path(temp)
+        env = {key: value for key, value in env.items()
+               if not key.startswith(("WALGIT__", "AZURE_STORAGE_")) and key != "PORT"}
+        token = secrets.token_urlsafe(32)
+        env.update(GIT_CONFIG_GLOBAL=str(directory / "gitconfig"), GIT_CONFIG_NOSYSTEM="1",
+                   GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="1",
+                   GIT_CONFIG_KEY_0="http.extraHeader",
+                   GIT_CONFIG_VALUE_0=f"Authorization: Bearer {token}",
+                   WALGIT_EVENT_GRID_SMOKE_TOKEN=token, AZURE_EXTENSION_USE_DYNAMIC_INSTALL="no")
+
+        def az(*args):
+            try:
+                return run(["az", *args, "--only-show-errors", "--output", "json"],
+                           env=env, timeout=90, capture=True).stdout
+            except subprocess.CalledProcessError as error:
+                raise RuntimeError(f"Azure CLI failed:\n{error.stderr}") from None
+
+        queue_args = ["--account-name", account, "--queue-name", queue, "--auth-mode", "login"]
+
+        def acknowledge(message):
+            az("storage", "message", "delete", *queue_args,
+               "--id", message["id"], "--pop-receipt", message["popReceipt"])
+
+        with HTTPServer(("127.0.0.1", 0), Sink) as sink:
+            worker = threading.Thread(target=sink.serve_forever, daemon=True)
+            worker.start()
+            sink_url = f"http://127.0.0.1:{sink.server_address[1]}"
+            try:
+                with urllib.request.urlopen(sink_url, timeout=2) as reply:
+                    assert reply.status == 200
+                for schema in ("native", "cloud"):
+                    work = directory / schema
+                    source = work / "source"
+                    source.mkdir(parents=True)
+                    prefix = f"event-grid-smoke/{schema}/{uuid4().hex}/"
+                    print(f"Event Grid {schema} prefix: {prefix}", flush=True)
+                    with socket.socket() as listener:
+                        listener.bind(("127.0.0.1", 0))
+                        port = listener.getsockname()[1]
+                    url = f"http://127.0.0.1:{port}"
+                    config = work / "walgit.toml"
+                    config.write_text(f'''
+[server]
+listen = "127.0.0.1:{port}"
+public_url = "{url}"
+auto_create_on_push = true
+roles = ["serve", "events"]
+[server.auth]
+mode = "token"
+anonymous_read = false
+[[server.auth.tokens]]
+principal = "event-grid-test"
+token_env = "WALGIT_EVENT_GRID_SMOKE_TOKEN"
+write = true
+[store]
+backend = "azure"
+bucket = {json.dumps(container)}
+prefix = "{prefix}"
+[store.azure]
+endpoint = {json.dumps(endpoint)}
+account = {json.dumps(account)}
+credential = "azure_cli"
+[cache]
+dir = {json.dumps(str(work / "cache"))}
+mode = "budget"
+max_bytes = "128MiB"
+[events]
+webhook_url = "{sink_url}"
+sweep_interval = "0s"
+''')
+
+                    def git(*args, capture=False):
+                        return run(["git", "-c", "user.name=Azure Test",
+                                    "-c", "user.email=azure-test@example.invalid", *args],
+                                   env=env, cwd=source, timeout=90, capture=capture)
+
+                    git("init", "-b", "main")
+                    manifest = prefix + "repos/test/azure/manifest.pb"
+                    subject = f"/blobServices/default/containers/{container}/blobs/{manifest}"
+                    notify = url + "/_events/notify"
+                    with server(binary, config, env, url, work / "server.log"):
+                        try:
+                            urllib.request.urlopen(urllib.request.Request(notify, data=b"{}"), timeout=5)
+                        except urllib.error.HTTPError as error:
+                            assert error.code == 401
+                        else:
+                            raise AssertionError("notify accepted an unauthenticated request")
+                        for seq in (1, 2):
+                            before = len(captured)
+                            git("commit", "--allow-empty", "-m", f"{schema} push {seq}")
+                            oid = git("rev-parse", "HEAD", capture=True).stdout.strip()
+                            git("push", url + "/test/azure.git", "main")
+                            etag = json.loads(az("storage", "blob", "show", "--account-name", account,
+                                "--container-name", container, "--name", manifest,
+                                "--auth-mode", "login", "--query", "properties.etag")).strip('"')
+                            assert len(captured) == before, "events arrived without a notification"
+                            deadline = time.monotonic() + 600
+                            notice_at = 0
+                            matched = None
+                            while time.monotonic() < deadline and matched is None:
+                                messages = json.loads(az("storage", "message", "get", *queue_args,
+                                    "--num-messages", "1", "--visibility-timeout", "600"))
+                                for message in messages:
+                                    payload = json.loads(base64.b64decode(message["content"], validate=True))
+                                    events = payload if isinstance(payload, list) else [payload]
+                                    assert len(events) == 1, "expected one Event Grid event per queue message"
+                                    event = events[0]
+                                    if event.get("subject") != subject:
+                                        continue
+                                    kind = "eventType" if schema == "native" else "type"
+                                    assert event[kind] == "Microsoft.Storage.BlobCreated"
+                                    if schema == "cloud":
+                                        assert event["specversion"] == "1.0"
+                                    if event["data"]["eTag"].strip('"') != etag:
+                                        acknowledge(message)
+                                        continue
+                                    print(f"{schema}: received {type(payload).__name__} JSON, "
+                                          f"{event['data']['api']}, ETag {etag}", flush=True)
+                                    matched = message
+                                if matched is None:
+                                    if time.monotonic() >= notice_at:
+                                        print(f"{schema}: waiting for manifest ETag {etag}", flush=True)
+                                        notice_at = time.monotonic() + 30
+                                    time.sleep(2)
+                            assert matched is not None, f"no {schema} notification for {subject}, ETag {etag}"
+                            for emitted in (1, 0):
+                                request = urllib.request.Request(notify, data=base64.b64decode(matched["content"], validate=True),
+                                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                                with urllib.request.urlopen(request, timeout=90) as reply:
+                                    reports = json.load(reply)
+                                assert len(reports) == 1
+                                assert reports[0]["head_seq"] == seq
+                                assert reports[0]["emitted"] == emitted
+                                assert len(captured) == before + 1
+                                event = captured[-1]
+                                assert event["repo"] == "test/azure"
+                                assert event["ref_name"] == "refs/heads/main"
+                                assert event["new"] == oid
+                                assert event["_walgit"]["seq"] == str(seq)
+                                cursor_url = f"{endpoint}/{container}/{prefix}repos/test/azure/events/cursor.json"
+                                cursor = json.loads(az("rest", "--method", "get", "--url", cursor_url,
+                                    "--resource", "https://storage.azure.com/", "--headers",
+                                    "x-ms-version=2023-11-03", f"x-ms-date={formatdate(usegmt=True)}"))
+                                assert cursor["published_seq"] == seq
+                            acknowledge(matched)
+                            print(f"{schema}: seq {seq}, OID {oid}, durable cursor and duplicate verified", flush=True)
+            finally:
+                sink.shutdown()
+                worker.join()
+    print("Azure Event Grid queue smoke passed for both schemas", flush=True)
+
+
 @contextlib.contextmanager
 def azurite():
     executable = os.environ.get("WALGIT_TEST_AZURITE")
@@ -204,21 +385,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--account", help="Existing live Azure storage account (Azure CLI identity)")
     parser.add_argument("--container", help="Existing container in that account")
+    parser.add_argument("--event-grid-queue", help="Existing test queue; run live Event Grid checks instead")
     args = parser.parse_args()
     if (args.account is None) != (args.container is None):
         parser.error("--account and --container must be supplied together")
+    if args.event_grid_queue is not None and args.account is None:
+        parser.error("--event-grid-queue requires live --account and --container")
     if args.account is not None:
         if not re.fullmatch(r"[a-z0-9]{3,24}", args.account):
             parser.error("--account must be a valid Azure storage account name")
         if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", args.container)
                 or "--" in args.container):
             parser.error("--container must be a valid Azure container name")
+        if args.event_grid_queue is not None and (
+                not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", args.event_grid_queue)
+                or "--" in args.event_grid_queue):
+            parser.error("--event-grid-queue must be a valid Azure queue name")
         if "AZURE_STORAGE_SAS_TOKEN" in os.environ:
             parser.error("unset AZURE_STORAGE_SAS_TOKEN to test Azure CLI identity")
         env = dict(os.environ, WALGIT_TEST_AZURE_ACCOUNT=args.account,
                    WALGIT_TEST_AZURE_CONTAINER=args.container,
                    WALGIT_TEST_AZURE_ENDPOINT=f"https://{args.account}.blob.core.windows.net")
-        check_backend(env)
+        if args.event_grid_queue is not None:
+            event_grid_smoke(env, args.event_grid_queue)
+        else:
+            check_backend(env)
         return
     with azurite() as endpoint:
         client = BlobServiceClient(endpoint, credential=KEY, retry_total=0, connection_timeout=1)
